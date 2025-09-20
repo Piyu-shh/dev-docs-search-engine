@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini Search Engine</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; background-color: #f4f4f9; color: #333; }
+        h1 { color: #0056b3; }
+        .search-container { display: flex; gap: 0.5em; margin-bottom: 2em; }
+        #search-box { flex-grow: 1; padding: 0.8em; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 0.8em 1.5em; border: none; background-color: #007bff; color: white; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        #results-container { background-color: white; padding: 1em; border-radius: 4px; border: 1px solid #ddd; }
+        .answer { border-bottom: 1px solid #eee; padding-bottom: 1em; margin-bottom: 1em; white-space: pre-wrap; }
+        .source { margin-bottom: 0.5em; }
+        .source a { text-decoration: none; color: #007bff; }
+        .source a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+<h1>Mini Search Engine</h1>
+
+<div class="search-container">
+    <input type="text" id="search-box" placeholder="Ask a question...">
+    <button id="search-button">Ask</button>
+</div>
+
+<div id="results-container">
+    <p>Results will appear here...</p>
+</div>
+
+<script>
+    const searchButton = document.getElementById('search-button');
+    const searchBox = document.getElementById('search-box');
+    const resultsContainer = document.getElementById('results-container');
+    const API_BASE_URL = '/api';
+
+    // Function to perform the search
+    async function performSearch() {
+        const query = searchBox.value.trim();
+        if (!query) {
+            resultsContainer.innerHTML = '<p>Please enter a question.</p>';
+            return;
+        }
+
+        resultsContainer.innerHTML = '<p>Thinking...</p>';
+
+        try {
+            const response = await fetch(`${API_BASE_URL}/ask?q=${encodeURIComponent(query)}`);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! Status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            displayResults(data);
+
+        } catch (error) {
+            console.error('Fetch error:', error);
+            resultsContainer.innerHTML = `<p>Error: Could not connect to the search engine. Is the backend running?</p>`;
+        }
+    }
+
+    // Function to display the results in the HTML
+    function displayResults(data) {
+        if (!data.answer) {
+            resultsContainer.innerHTML = '<p>No answer found.</p>';
+            return;
+        }
+
+        // Clear previous results
+        resultsContainer.innerHTML = '';
+
+        // Display the AI-generated answer
+        const answerDiv = document.createElement('div');
+        answerDiv.className = 'answer';
+        answerDiv.innerHTML = `<h3>Answer</h3><p>${data.answer.replace(/\n/g, '<br>')}</p>`;
+        resultsContainer.appendChild(answerDiv);
+
+        // Display the sources
+        if (data.sources && data.sources.length > 0) {
+            const sourcesHeader = document.createElement('h3');
+            sourcesHeader.textContent = 'Sources';
+            resultsContainer.appendChild(sourcesHeader);
+
+            data.sources.forEach(source => {
+                const sourceDiv = document.createElement('div');
+                sourceDiv.className = 'source';
+                sourceDiv.innerHTML = `<a href="${source.url}" target="_blank">${source.title}</a>`;
+                resultsContainer.appendChild(sourceDiv);
+            });
+        }
+    }
+
+    searchButton.addEventListener('click', performSearch);
+    searchBox.addEventListener('keyup', (event) => {
+        if (event.key === 'Enter') {
+            performSearch();
+        }
+    });
+</script>
+
+</body>
+</html>
