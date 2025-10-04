@@ -37,6 +37,7 @@ public class IndexingService {
         // reIndexAll();
     }
 
+    @Transactional(readOnly = true)
     public void reIndexAll() {
         System.out.println("Starting to re-index all pages...");
         try (IndexWriter writer = createWriter()) {
