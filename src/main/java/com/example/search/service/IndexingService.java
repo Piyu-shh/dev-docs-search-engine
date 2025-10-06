@@ -30,7 +30,7 @@ public class IndexingService {
     private Directory indexDirectory;
 
 
-    @Autowired
+    @Autowired @Lazy
     private IndexingService self;
 
     public IndexingService(WebPageRepository webPageRepository) {
