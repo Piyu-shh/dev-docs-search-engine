@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -28,6 +29,10 @@ public class IndexingService {
     private final WebPageRepository webPageRepository;
     private Directory indexDirectory;
 
+
+    @Autowired
+    private IndexingService self;
+
     public IndexingService(WebPageRepository webPageRepository) {
         this.webPageRepository = webPageRepository;
     }
@@ -35,8 +40,7 @@ public class IndexingService {
     @PostConstruct
     public void init() throws IOException {
         this.indexDirectory = FSDirectory.open(Paths.get(INDEX_DIR));
-        // Optional: Clear the index on startup and re-index everything
-        // reIndexAll();
+        reIndexAll();
     }
 
     @Transactional(readOnly = true)
