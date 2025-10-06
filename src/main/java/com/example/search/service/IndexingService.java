@@ -41,7 +41,6 @@ public class IndexingService {
     @PostConstruct
     public void init() throws IOException {
         this.indexDirectory = FSDirectory.open(Paths.get(INDEX_DIR));
-        reIndexAll();
     }
 
     @Transactional(readOnly = true)
@@ -76,6 +75,7 @@ public class IndexingService {
     private IndexWriter createWriter() throws IOException {
         IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer());
         config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        IndexWriterConfig indexWriterConfig = config.setRAMBufferSizeMB(16.0);
         return new IndexWriter(indexDirectory, config);
     }
 }
