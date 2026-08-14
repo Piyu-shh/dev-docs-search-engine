@@ -33,3 +33,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Data & Index Directories ###
+lucene-index/
+chroma_db/
+chroma-data/
+*.log

@@ -1,106 +1,240 @@
 package com.example.search.service;
 
-import com.example.search.dto.*;
+import com.example.search.dto.RagResponse;
+import com.example.search.dto.SearchResultDto;
+import com.example.search.dto.VectorDto;
 import com.example.search.model.WebPage;
 import com.example.search.repository.WebPageRepository;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Service
 public class RAGService {
 
     private final SearchService searchService;
-    private final WebClient webClient;
+    private final ChunkerService chunkerService;
+    private final ChromaVectorDBService chromaVectorDBService;
+    private final ChatService chatService;
+    private final ChatContextService chatContextService;
     private final WebPageRepository webPageRepository;
+    private static final int LUCENE_RESULTS = 10;
+    private static final int CHROMA_RESULTS = 5;
+    private static final int MAX_CONTEXT_LENGTH = 8000;
 
-    public RAGService(SearchService searchService, @Value("${api.openrouter.key}") String apiKey, WebPageRepository webPageRepository) {
+    public RAGService(
+            SearchService searchService,
+            ChunkerService chunkerService,
+            ChromaVectorDBService chromaVectorDBService,
+            ChatService chatService,
+            ChatContextService chatContextService,
+            WebPageRepository webPageRepository) {
         this.searchService = searchService;
+        this.chunkerService = chunkerService;
+        this.chromaVectorDBService = chromaVectorDBService;
+        this.chatService = chatService;
+        this.chatContextService = chatContextService;
         this.webPageRepository = webPageRepository;
-        this.webClient = WebClient.builder()
-                .baseUrl("https://openrouter.ai/api/v1")
-                .defaultHeader("Authorization", "Bearer " + apiKey)
-                .defaultHeader("Content-Type", "application/json")
-                .build();
     }
 
-    public RagResponse ask(String question) {
-        // Step 1: Get up to 10 results from the search service
-        List<SearchResultDto> allResults = searchService.search(question);
-
-        if (allResults.isEmpty()) {
-            return new RagResponse("I couldn't find any relevant documents to answer your question.", new ArrayList<>());
+    /**
+     * Answer a question using lazy RAG:
+     * 1. Lucene search for 10 pages
+     * 2. Check which pages already have embeddings in ChromaDB
+     * 3. Only chunk and embed pages without embeddings (5000 char chunks)
+     * 4. Query ChromaDB for similar chunks
+     * 5. Send to LLM with chat context
+     */
+    public RagResponse ask(String sessionId, String question) {
+        if (question == null || question.trim().isEmpty()) {
+            return new RagResponse("Question cannot be empty.", new ArrayList<>());
         }
-
-        // --- FIX 1: Correctly limit the sources used for context ---
-        // Keep only the top 2 from that list to build the context for the LLM
-        List<SearchResultDto> contextSources = allResults.stream().limit(2).toList(); // Use .limit(2) here
-
-        // Step 3: Build the context string by fetching content from the database for the top 2 sources
-        String context = contextSources.stream()
-                .map(dto -> {
-                    String content = webPageRepository.findByUrl(dto.getUrl())
-                            .map(WebPage::getContent)
-                            .orElse("[Content not found for this URL]");
-                    // Basic length limit per document to prevent one huge doc overwhelming the context
-                    if (content.length() > 4000) {
-                        content = content.substring(0, 4000) + "... (truncated)";
-                    }
-                    return "Title: " + dto.getTitle() + "\nContent: " + content;
-                })
-                .collect(Collectors.joining("\n---\n"));
-
-        // Step 4: Prepare and send the request to the LLM
-        OpenRouterRequest request = createOpenRouterRequest(question, context);
 
         try {
-            OpenRouterResponse response = webClient.post()
-                    .uri("/chat/completions")
-                    .bodyValue(request)
-                    .retrieve()
-                    .bodyToMono(OpenRouterResponse.class)
-                    .block(); // Using .block() for simplicity
+            System.out.println("\n========== RAG PIPELINE START ==========");
+            System.out.println("Session: " + sessionId);
+            System.out.println("Question: " + question);
 
-            if (response == null || response.choices() == null || response.choices().isEmpty()) {
-                return new RagResponse("Received an empty response from the AI model.", allResults);
+            // Step 1: Lucene search for relevant pages
+            System.out.println("\n--- Step 1: Lucene Search ---");
+            List<SearchResultDto> luceneResults = searchService.search(question);
+            System.out.println("Lucene returned " + luceneResults.size() + " results");
+            
+            if (luceneResults.isEmpty()) {
+                System.out.println("No Lucene results found. Returning empty response.");
+                return new RagResponse(
+                        "I couldn't find any relevant documents to answer your question.",
+                        new ArrayList<>()
+                );
             }
 
-            String answer = response.choices().get(0).message().content();
+            // Limit to top N from Lucene
+            List<SearchResultDto> topResults = luceneResults.stream()
+                    .limit(LUCENE_RESULTS)
+                    .collect(Collectors.toList());
 
-            // Step 5: Return the answer with the FULL list of sources
-            return new RagResponse(answer, allResults);
+            for (int i = 0; i < topResults.size(); i++) {
+                System.out.println("  Lucene[" + i + "]: " + topResults.get(i).getTitle() + " - " + topResults.get(i).getUrl());
+            }
+
+            // Step 2 & 3: Check embeddings and generate for missing pages
+            System.out.println("\n--- Step 2 & 3: Embedding Check & Generation ---");
+            List<ChunkerService.TextChunk> allChunks = new ArrayList<>();
+            List<String> urlsNeedingEmbedding = new ArrayList<>();
+
+            for (SearchResultDto result : topResults) {
+                boolean hasEmbeddings = false;
+                try {
+                    hasEmbeddings = chromaVectorDBService.hasEmbeddingsForUrl(result.getUrl());
+                } catch (Exception e) {
+                    System.err.println("Error checking embeddings for " + result.getUrl() + ": " + e.getMessage());
+                }
+
+                if (!hasEmbeddings) {
+                    urlsNeedingEmbedding.add(result.getUrl());
+                    
+                    // Get content from MongoDB and chunk it
+                    webPageRepository.findByUrl(result.getUrl()).ifPresent(page -> {
+                        String content = page.getContent();
+                        if (content != null && !content.trim().isEmpty()) {
+                            List<ChunkerService.TextChunk> chunks = chunkerService.chunkWebPage(
+                                    page.getUrl(),
+                                    page.getTitle(),
+                                    content
+                            );
+                            System.out.println("  Chunked: " + page.getUrl() + " -> " + chunks.size() + " chunks");
+                            allChunks.addAll(chunks);
+                        } else {
+                            System.out.println("  SKIP (no content): " + page.getUrl());
+                        }
+                    });
+                } else {
+                    System.out.println("  Already embedded: " + result.getUrl());
+                }
+            }
+
+            // Generate embeddings for new chunks
+            if (!allChunks.isEmpty()) {
+                System.out.println("Generating embeddings for " + urlsNeedingEmbedding.size() + 
+                    " new pages (" + allChunks.size() + " chunks)");
+                chromaVectorDBService.addChunks(allChunks);
+                System.out.println("Completed embedding generation");
+            } else {
+                System.out.println("All pages already have embeddings (or no content to embed)");
+            }
+
+            // Step 4: Query Chroma for similar chunks
+            System.out.println("\n--- Step 4: Vector Similarity Search ---");
+            List<VectorDto> similarChunks = chromaVectorDBService.querySimilar(
+                    question,
+                    CHROMA_RESULTS
+            );
+
+            System.out.println("Chroma returned " + similarChunks.size() + " similar chunks");
+
+            if (similarChunks.isEmpty()) {
+                System.out.println("WARNING: No similar chunks found in Chroma. Returning fallback response.");
+                return new RagResponse(
+                        "I couldn't find relevant content chunks to answer your question. " +
+                        "This may mean the documents haven't been properly indexed yet. " +
+                        "Try crawling and indexing some pages first.",
+                        topResults
+                );
+            }
+
+            // Step 5: Build context from similar chunks
+            System.out.println("\n--- Step 5: Building LLM Context ---");
+            String context = similarChunks.stream()
+                    .map(v -> {
+                        String content = v.getText() != null ? v.getText() : "";
+                        if (content.length() > 1500) {
+                            content = content.substring(0, 1500) + "... (truncated)";
+                        }
+                        return "Title: " + v.getTitle() + "\nURL: " + v.getUrl() + "\nContent: " + content;
+                    })
+                    .collect(Collectors.joining("\n\n---\n\n"));
+
+            // Truncate context if needed
+            if (context.length() > MAX_CONTEXT_LENGTH) {
+                context = context.substring(0, MAX_CONTEXT_LENGTH) + "\n\n... (truncated)";
+            }
+
+            System.out.println("Context built, length=" + context.length());
+
+            // Step 6: Update chat context
+            chatContextService.addUserMessage(sessionId, question);
+
+            // Step 7: Get chat history
+            String chatHistory = chatContextService.buildContextString(sessionId);
+
+            // Step 8: Send to LLM with context and chat history
+            System.out.println("\n--- Step 6-8: LLM Call ---");
+            String answer = chatService.chatWithContextAndHistory(question, context, chatHistory);
+
+            // Step 9: Update chat context with assistant response
+            chatContextService.addAssistantMessage(sessionId, answer);
+
+            // Step 10: Return answer with sources
+            List<SearchResultDto> sources = similarChunks.stream()
+                    .map(v -> new SearchResultDto(v.getUrl(), v.getTitle()))
+                    .distinct()
+                    .collect(Collectors.toList());
+
+            System.out.println("\n========== RAG PIPELINE COMPLETE ==========");
+            System.out.println("Answer length: " + answer.length());
+            System.out.println("Sources: " + sources.size());
+
+            return new RagResponse(answer, sources);
 
         } catch (Exception e) {
-            System.err.println("Error calling LLM API: " + e.getMessage());
-            // It's good practice to log the stack trace for debugging
-            // e.printStackTrace();
-            return new RagResponse("There was an error while communicating with the AI model.", allResults);
+            System.err.println("Error in RAG ask: " + e.getMessage());
+            e.printStackTrace();
+            return new RagResponse(
+                    "There was an error processing your question: " + e.getMessage(),
+                    new ArrayList<>()
+            );
         }
     }
 
-    private OpenRouterRequest createOpenRouterRequest(String question, String context) {
-        // Max characters for the combined context (retrieved documents)
-        final int MAX_CONTEXT_CHARACTERS = 8000; // Roughly 2000 tokens
+    /**
+     * Clear chat context for a session
+     */
+    public void clearChatContext(String sessionId) {
+        chatContextService.clearContext(sessionId);
+    }
 
-        // Truncate the *combined* context if it exceeds the overall limit
-        if (context.length() > MAX_CONTEXT_CHARACTERS) {
-            context = context.substring(0, MAX_CONTEXT_CHARACTERS);
-            context += "\n\n--- CONTENT TRUNCATED ---";
+    /**
+     * Get chat history for a session
+     */
+    public java.util.List<java.util.Map<String, Object>> getChatHistory(String sessionId) {
+        java.util.List<ChatContextService.ChatMessage> messages = chatContextService.getChatContext(sessionId);
+        java.util.List<java.util.Map<String, Object>> history = new java.util.ArrayList<>();
+        
+        for (ChatContextService.ChatMessage msg : messages) {
+            java.util.Map<String, Object> messageMap = new java.util.HashMap<>();
+            messageMap.put("role", msg.getRole());
+            messageMap.put("content", msg.getContent());
+            messageMap.put("timestamp", msg.getTimestamp());
+            history.add(messageMap);
         }
+        
+        return history;
+    }
 
-        String prompt = String.format(
-                "Based *only* on the following documents, please answer the user's question in a concise and helpful natural language form. Do not include special formatting like markdown. If the information needed to answer the question is not in the provided documents, explicitly state that the answer was not found in the documents. Do not use outside knowledge. Mention the source titles relevant to your answer.\n\n" +
-                        "User's Question: \"%s\"\n\n" +
-                        "Retrieved Documents:\n%s", question, context);
+    /**
+     * Get Chroma vector DB statistics
+     */
+    public String getVectorDbStats() {
+        return chromaVectorDBService.getCollectionStats();
+    }
 
-        List<Message> messages = List.of(new Message("user", prompt));
-
-        // --- FIX 2: Correct the model name ---
-        // The ':free' suffix is usually not part of the API model ID.
-        return new OpenRouterRequest("deepseek/deepseek-chat-v3.1", messages);
+    /**
+     * Clear Chroma vector DB
+     */
+    public void clearVectorDb() {
+        chromaVectorDBService.clearCollection();
     }
 }

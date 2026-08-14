@@ -28,14 +28,16 @@ public class IndexingService {
 
     private static final String INDEX_DIR = "./lucene-index";
     private final WebPageRepository webPageRepository;
+    private final RAGService ragService;
     private Directory indexDirectory;
 
 
     @Autowired @Lazy
     private IndexingService self;
 
-    public IndexingService(WebPageRepository webPageRepository) {
+    public IndexingService(WebPageRepository webPageRepository, RAGService ragService) {
         this.webPageRepository = webPageRepository;
+        this.ragService = ragService;
     }
 
     @PostConstruct
@@ -45,31 +47,33 @@ public class IndexingService {
 
     @Transactional(readOnly = true)
     public void reIndexAll() {
-        System.out.println("Starting to re-index all pages from database...");
+        System.out.println("Starting to re-index all pages...");
+        
+        // Step 1: Re-index in Lucene for full-text search
         try (IndexWriter writer = createWriter()) {
             writer.deleteAll(); // Clear existing index
 
-            // Use a try-with-resources block to ensure the stream is closed
             try (Stream<WebPage> pages = webPageRepository.findAll().stream()) {
-                final int[] count = {0}; // Use an array to count inside the lambda
+                final int[] count = {0};
                 pages.forEach(page -> {
                     try {
                         Document doc = new Document();
                         doc.add(new StringField("url", page.getUrl(), Field.Store.YES));
                         doc.add(new TextField("title", page.getTitle(), Field.Store.YES));
-                        // Use the recommended method of storing content for RAG
                         doc.add(new TextField("content", page.getContent(), Field.Store.YES));
                         writer.addDocument(doc);
                         count[0]++;
                     } catch (IOException e) {
-                        System.err.println("Error indexing page " + page.getUrl() + ": " + e.getMessage());
+                        System.err.println("Error indexing page in Lucene " + page.getUrl() + ": " + e.getMessage());
                     }
                 });
-                System.out.println("Finished re-indexing " + count[0] + " pages.");
+                System.out.println("Finished re-indexing " + count[0] + " pages in Lucene.");
             }
         } catch (IOException e) {
             System.err.println("Error re-indexing all pages: " + e.getMessage());
         }
+
+        System.out.println("Lucene re-indexing complete. Vector database indexing will happen dynamically during RAG queries.");
     }
 
     private IndexWriter createWriter() throws IOException {
