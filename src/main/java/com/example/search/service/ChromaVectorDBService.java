@@ -31,9 +31,10 @@ public class ChromaVectorDBService {
 
     public ChromaVectorDBService(
             @Value("${chroma.url:http://localhost:8000}") String chromaUrl,
+            @Value("${chroma.collection.name:web_pages_chunks}") String collectionName,
             EmbeddingsService embeddingsService) {
         this.embeddingsService = embeddingsService;
-        this.collectionName = "web_pages_chunks";
+        this.collectionName = collectionName;
         this.webClient = WebClient.builder()
                 .baseUrl(chromaUrl)
                 .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(16 * 1024 * 1024))
