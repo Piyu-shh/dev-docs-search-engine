@@ -21,8 +21,8 @@ public class RAGService {
     private final ChatService chatService;
     private final ChatContextService chatContextService;
     private final WebPageRepository webPageRepository;
-    private static final int LUCENE_RESULTS = 10;
-    private static final int CHROMA_RESULTS = 5;
+    private final int luceneResultsCount;
+    private final int chromaResultsCount;
     private static final int MAX_CONTEXT_LENGTH = 8000;
 
     public RAGService(
@@ -31,21 +31,25 @@ public class RAGService {
             ChromaVectorDBService chromaVectorDBService,
             ChatService chatService,
             ChatContextService chatContextService,
-            WebPageRepository webPageRepository) {
+            WebPageRepository webPageRepository,
+            @org.springframework.beans.factory.annotation.Value("${lucene.results.count:10}") int luceneResultsCount,
+            @org.springframework.beans.factory.annotation.Value("${chroma.results.count:5}") int chromaResultsCount) {
         this.searchService = searchService;
         this.chunkerService = chunkerService;
         this.chromaVectorDBService = chromaVectorDBService;
         this.chatService = chatService;
         this.chatContextService = chatContextService;
         this.webPageRepository = webPageRepository;
+        this.luceneResultsCount = luceneResultsCount;
+        this.chromaResultsCount = chromaResultsCount;
     }
 
     /**
      * Answer a question using lazy RAG:
-     * 1. Lucene search for 10 pages
+     * 1. Lucene search for relevant pages
      * 2. Check which pages already have embeddings in ChromaDB
      * 3. Only chunk and embed pages without embeddings (5000 char chunks)
-     * 4. Query ChromaDB for similar chunks
+     * 4. Query ChromaDB for similar chunks (with fallback to MongoDB full text)
      * 5. Send to LLM with chat context
      */
     public RagResponse ask(String sessionId, String question) {
@@ -62,23 +66,19 @@ public class RAGService {
             System.out.println("\n--- Step 1: Lucene Search ---");
             List<SearchResultDto> luceneResults = searchService.search(question);
             System.out.println("Lucene returned " + luceneResults.size() + " results");
-            
+
             if (luceneResults.isEmpty()) {
                 System.out.println("No Lucene results found. Returning empty response.");
                 return new RagResponse(
-                        "I couldn't find any relevant documents to answer your question.",
+                        "I couldn't find any relevant documents to answer your question. Try crawling some websites or re-indexing.",
                         new ArrayList<>()
                 );
             }
 
             // Limit to top N from Lucene
             List<SearchResultDto> topResults = luceneResults.stream()
-                    .limit(LUCENE_RESULTS)
+                    .limit(luceneResultsCount)
                     .collect(Collectors.toList());
-
-            for (int i = 0; i < topResults.size(); i++) {
-                System.out.println("  Lucene[" + i + "]: " + topResults.get(i).getTitle() + " - " + topResults.get(i).getUrl());
-            }
 
             // Step 2 & 3: Check embeddings and generate for missing pages
             System.out.println("\n--- Step 2 & 3: Embedding Check & Generation ---");
@@ -95,98 +95,103 @@ public class RAGService {
 
                 if (!hasEmbeddings) {
                     urlsNeedingEmbedding.add(result.getUrl());
-                    
+
                     // Get content from MongoDB and chunk it
                     webPageRepository.findByUrl(result.getUrl()).ifPresent(page -> {
                         String content = page.getContent();
                         if (content != null && !content.trim().isEmpty()) {
                             List<ChunkerService.TextChunk> chunks = chunkerService.chunkWebPage(
                                     page.getUrl(),
-                                    page.getTitle(),
+                                    page.getTitle() != null ? page.getTitle() : "",
                                     content
                             );
-                            System.out.println("  Chunked: " + page.getUrl() + " -> " + chunks.size() + " chunks");
                             allChunks.addAll(chunks);
-                        } else {
-                            System.out.println("  SKIP (no content): " + page.getUrl());
                         }
                     });
-                } else {
-                    System.out.println("  Already embedded: " + result.getUrl());
                 }
             }
 
             // Generate embeddings for new chunks
             if (!allChunks.isEmpty()) {
-                System.out.println("Generating embeddings for " + urlsNeedingEmbedding.size() + 
-                    " new pages (" + allChunks.size() + " chunks)");
-                chromaVectorDBService.addChunks(allChunks);
-                System.out.println("Completed embedding generation");
-            } else {
-                System.out.println("All pages already have embeddings (or no content to embed)");
+                System.out.println("Generating embeddings for " + urlsNeedingEmbedding.size() +
+                        " new pages (" + allChunks.size() + " chunks)");
+                try {
+                    chromaVectorDBService.addChunks(allChunks);
+                } catch (Exception e) {
+                    System.err.println("Error storing chunks in ChromaDB: " + e.getMessage());
+                }
             }
 
             // Step 4: Query Chroma for similar chunks
             System.out.println("\n--- Step 4: Vector Similarity Search ---");
-            List<VectorDto> similarChunks = chromaVectorDBService.querySimilar(
-                    question,
-                    CHROMA_RESULTS
-            );
-
-            System.out.println("Chroma returned " + similarChunks.size() + " similar chunks");
-
-            if (similarChunks.isEmpty()) {
-                System.out.println("WARNING: No similar chunks found in Chroma. Returning fallback response.");
-                return new RagResponse(
-                        "I couldn't find relevant content chunks to answer your question. " +
-                        "This may mean the documents haven't been properly indexed yet. " +
-                        "Try crawling and indexing some pages first.",
-                        topResults
-                );
+            List<VectorDto> similarChunks = new ArrayList<>();
+            try {
+                similarChunks = chromaVectorDBService.querySimilar(question, chromaResultsCount);
+            } catch (Exception e) {
+                System.err.println("Vector search failed, falling back to Lucene documents: " + e.getMessage());
             }
 
-            // Step 5: Build context from similar chunks
-            System.out.println("\n--- Step 5: Building LLM Context ---");
-            String context = similarChunks.stream()
-                    .map(v -> {
-                        String content = v.getText() != null ? v.getText() : "";
+            String context;
+            List<SearchResultDto> sources;
+
+            if (!similarChunks.isEmpty()) {
+                // Build context from similar chunks
+                context = similarChunks.stream()
+                        .map(v -> {
+                            String content = v.getText() != null ? v.getText() : "";
+                            if (content.length() > 1500) {
+                                content = content.substring(0, 1500) + "... (truncated)";
+                            }
+                            return "Title: " + v.getTitle() + "\nURL: " + v.getUrl() + "\nContent: " + content;
+                        })
+                        .collect(Collectors.joining("\n\n---\n\n"));
+
+                sources = similarChunks.stream()
+                        .map(v -> new SearchResultDto(v.getUrl(), v.getTitle()))
+                        .filter(s -> s.getUrl() != null && !s.getUrl().isEmpty())
+                        .distinct()
+                        .collect(Collectors.toList());
+            } else {
+                // Fallback: build context from top Lucene results via MongoDB
+                System.out.println("Using Lucene results fallback for context building");
+                StringBuilder sb = new StringBuilder();
+                List<SearchResultDto> fallbackSources = new ArrayList<>();
+
+                for (SearchResultDto item : topResults) {
+                    webPageRepository.findByUrl(item.getUrl()).ifPresent(page -> {
+                        String content = page.getContent() != null ? page.getContent() : "";
                         if (content.length() > 1500) {
                             content = content.substring(0, 1500) + "... (truncated)";
                         }
-                        return "Title: " + v.getTitle() + "\nURL: " + v.getUrl() + "\nContent: " + content;
-                    })
-                    .collect(Collectors.joining("\n\n---\n\n"));
+                        sb.append("Title: ").append(page.getTitle()).append("\n")
+                          .append("URL: ").append(page.getUrl()).append("\n")
+                          .append("Content: ").append(content).append("\n\n---\n\n");
+                        fallbackSources.add(new SearchResultDto(page.getUrl(), page.getTitle()));
+                    });
+                }
+                context = sb.toString();
+                sources = fallbackSources.stream().distinct().collect(Collectors.toList());
+            }
 
             // Truncate context if needed
             if (context.length() > MAX_CONTEXT_LENGTH) {
                 context = context.substring(0, MAX_CONTEXT_LENGTH) + "\n\n... (truncated)";
             }
 
-            System.out.println("Context built, length=" + context.length());
-
-            // Step 6: Update chat context
+            // Step 5: Update chat context
             chatContextService.addUserMessage(sessionId, question);
 
-            // Step 7: Get chat history
+            // Step 6: Get chat history
             String chatHistory = chatContextService.buildContextString(sessionId);
 
-            // Step 8: Send to LLM with context and chat history
-            System.out.println("\n--- Step 6-8: LLM Call ---");
+            // Step 7: Send to LLM with context and chat history
+            System.out.println("\n--- Step 5-7: LLM Call ---");
             String answer = chatService.chatWithContextAndHistory(question, context, chatHistory);
 
-            // Step 9: Update chat context with assistant response
+            // Step 8: Update chat context with assistant response
             chatContextService.addAssistantMessage(sessionId, answer);
 
-            // Step 10: Return answer with sources
-            List<SearchResultDto> sources = similarChunks.stream()
-                    .map(v -> new SearchResultDto(v.getUrl(), v.getTitle()))
-                    .distinct()
-                    .collect(Collectors.toList());
-
             System.out.println("\n========== RAG PIPELINE COMPLETE ==========");
-            System.out.println("Answer length: " + answer.length());
-            System.out.println("Sources: " + sources.size());
-
             return new RagResponse(answer, sources);
 
         } catch (Exception e) {

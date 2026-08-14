@@ -152,6 +152,27 @@
             align-self:flex-start; border-bottom-left-radius:4px;
             border:1px solid var(--border);
         }
+        .code-block {
+            background: rgba(0,0,0,0.4);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin: 8px 0;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.82rem;
+            color: #38bdf8;
+            line-height: 1.4;
+        }
+        .inline-code {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.82rem;
+            color: #38bdf8;
+        }
         .message .timestamp {
             font-size:0.65rem; opacity:0.5; margin-top:8px; display:block;
         }
@@ -372,6 +393,33 @@
             }
         }
 
+        function formatMarkdown(text){
+            if(!text) return '';
+            let escaped = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            // Code blocks
+            escaped = escaped.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
+                return '<pre class="code-block"><code>' + code.trim() + '</code></pre>';
+            });
+
+            // Inline code
+            escaped = escaped.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+
+            // Bold
+            escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+            // Italic
+            escaped = escaped.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+            // Newlines (outside pre blocks)
+            escaped = escaped.replace(/\n/g, '<br>');
+
+            return escaped;
+        }
+
         function addMessage(text,role,sources=null){
             const c=document.getElementById('chatMessages');
             const es=document.getElementById('emptyState');
@@ -379,10 +427,11 @@
 
             const div=document.createElement('div');
             div.className='message '+role;
-            let html='<div>'+text.replace(/\n/g,'<br>')+'</div>';
+            let formattedContent = role === 'assistant' ? formatMarkdown(text) : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g,'<br>');
+            let html='<div>'+formattedContent+'</div>';
             if(sources&&sources.length>0){
                 html+='<div class="sources"><h4>📎 Sources</h4>';
-                sources.forEach(s=>{html+='<a href="'+s.url+'" target="_blank">'+s.title+'</a>';});
+                sources.forEach(s=>{html+='<a href="'+s.url+'" target="_blank">'+ (s.title || s.url) +'</a>';});
                 html+='</div>';
             }
             html+='<span class="timestamp">'+new Date().toLocaleTimeString()+'</span>';

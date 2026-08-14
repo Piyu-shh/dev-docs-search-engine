@@ -37,17 +37,25 @@ public class CrawlController {
             @RequestParam String startUrl,
             @RequestParam(defaultValue = "2") int depth) {
 
-        if (startUrl == null || startUrl.isEmpty()) {
+        if (startUrl == null || startUrl.trim().isEmpty()) {
             return ResponseEntity.badRequest().body("startUrl parameter is required.");
         }
 
-        new Thread(() -> crawlerService.startRecursiveCrawl(startUrl, depth)).start();
-        return ResponseEntity.ok("Recursive crawl initiated for: " + startUrl + " up to depth " + depth);
+        String trimmedUrl = startUrl.trim();
+        if (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://")) {
+            return ResponseEntity.badRequest().body("startUrl must start with http:// or https://");
+        }
+
+        // Clamp depth between 1 and 5 to prevent overload
+        int safeDepth = Math.max(1, Math.min(depth, 5));
+
+        java.util.concurrent.CompletableFuture.runAsync(() -> crawlerService.startRecursiveCrawl(trimmedUrl, safeDepth));
+        return ResponseEntity.ok("Recursive crawl initiated for: " + trimmedUrl + " up to depth " + safeDepth);
     }
 
     @GetMapping("/index")
     public ResponseEntity<String> startIndexing() {
-        new Thread(indexingService::reIndexAll).start();
+        java.util.concurrent.CompletableFuture.runAsync(indexingService::reIndexAll);
         return ResponseEntity.ok("Re-indexing of all crawled pages initiated. This includes Lucene full-text index.");
     }
 
