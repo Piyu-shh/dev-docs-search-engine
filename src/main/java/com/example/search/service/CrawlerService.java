@@ -13,102 +13,123 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class CrawlerService {
 
     private final WebPageRepository webPageRepository;
     private final Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
-    private ThreadPoolExecutor executorService;
     private final RateLimiter rateLimiter = RateLimiter.create(5.0);
+    private final AtomicInteger inFlightTasks = new AtomicInteger(0);
 
     public CrawlerService(WebPageRepository webPageRepository) {
         this.webPageRepository = webPageRepository;
     }
 
-    public void startRecursiveCrawl(String startUrl, int maxDepth) {
-        executorService = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
-        visitedUrls.clear();
-        System.out.println("Starting multithreaded crawl from: " + startUrl);
-        submitCrawlTask(startUrl, 0, maxDepth, startUrl);
-        monitorAndShutdown();
-    }
-
-    // CORRECTED LOGIC
-    private void submitCrawlTask(String url, int depth, int maxDepth, String startUrl) {
-        // We only check the depth here. The main check will happen inside the thread.
-        if (depth > maxDepth) {
+    public synchronized void startRecursiveCrawl(String startUrl, int maxDepth) {
+        if (startUrl == null || startUrl.trim().isEmpty()) {
             return;
         }
+
+        String normalizedStartUrl = normalizeUrl(startUrl);
+        visitedUrls.clear();
+        inFlightTasks.set(0);
+
+        ThreadPoolExecutor executorService = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
+        System.out.println("Starting multithreaded crawl from: " + normalizedStartUrl);
+
+        submitCrawlTask(executorService, normalizedStartUrl, 0, maxDepth, normalizedStartUrl);
+        monitorAndShutdown(executorService);
+    }
+
+    private void submitCrawlTask(ThreadPoolExecutor executorService, String url, int depth, int maxDepth, String startUrl) {
+        if (depth > maxDepth || executorService.isShutdown()) {
+            return;
+        }
+
+        String normalizedUrl = normalizeUrl(url);
+        if (normalizedUrl.isEmpty()) {
+            return;
+        }
+
+        // Check visited before submitting to avoid queue bloat and redundant requests
+        if (!visitedUrls.add(normalizedUrl)) {
+            return;
+        }
+
+        inFlightTasks.incrementAndGet();
 
         executorService.submit(() -> {
             try {
                 rateLimiter.acquire();
 
-                // --- THIS IS THE SIMPLIFIED AND CORRECTED LOGIC ---
-                // 1. Get the response and the final URL after any redirects
-                var response = Jsoup.connect(url)
+                var response = Jsoup.connect(normalizedUrl)
                         .userAgent("MyMiniSearchEngineCrawler/1.0")
                         .timeout(10000)
+                        .followRedirects(true)
                         .execute();
-                String finalUrl = response.url().toString().split("#")[0];
 
-                // 2. Perform ONE atomic check. If 'add' returns true, it's a new URL.
-                if (!visitedUrls.add(finalUrl)) {
-                    // This URL has already been queued or processed by another thread.
-                    return;
-                }
-
-                // 3. Check if it's already in the database from a previous crawl session
-                if (webPageRepository.findByUrl(finalUrl).isPresent()) {
-                    System.out.println("URL already in database: " + finalUrl);
-                    return;
+                String finalUrl = normalizeUrl(response.url().toString());
+                if (!finalUrl.isEmpty()) {
+                    visitedUrls.add(finalUrl);
                 }
 
                 Document doc = response.parse();
-                // --- END OF CORRECTION ---
+                String title = doc.title() != null ? doc.title() : "";
+                String content = doc.body() != null ? doc.body().text() : "";
 
-                String title = doc.title();
-                String content = doc.body().text();
+                // Only save if not already present in database
+                if (webPageRepository.findByUrl(finalUrl).isEmpty()) {
+                    webPageRepository.save(new WebPage(finalUrl, title, content));
+                    System.out.println("Crawled (Depth: " + depth + "): " + title + " [" + finalUrl + "]");
+                } else {
+                    System.out.println("URL already in database: " + finalUrl);
+                }
 
-                webPageRepository.save(new WebPage(finalUrl, title, content));
-                System.out.println("Crawled (Depth: " + depth + "): " + title);
-
-                Elements linkElements = doc.select("a[href]");
-                for (var linkElement : linkElements) {
-                    String absUrl = linkElement.attr("abs:href").split("#")[0];
-                    if (!absUrl.isEmpty() && isSameDomain(startUrl, absUrl)) {
-                        submitCrawlTask(absUrl, depth + 1, maxDepth, startUrl);
+                if (depth < maxDepth) {
+                    Elements linkElements = doc.select("a[href]");
+                    for (var linkElement : linkElements) {
+                        String absUrl = normalizeUrl(linkElement.attr("abs:href"));
+                        if (!absUrl.isEmpty() && isSameDomain(startUrl, absUrl)) {
+                            submitCrawlTask(executorService, absUrl, depth + 1, maxDepth, startUrl);
+                        }
                     }
                 }
             } catch (IOException | IllegalArgumentException e) {
-                // It's okay for some URLs to fail, just log it.
-                // System.err.println("Error crawling " + url + ": " + e.getMessage());
+                // Log and ignore individual crawl failures
+            } finally {
+                inFlightTasks.decrementAndGet();
             }
         });
     }
 
-    private void monitorAndShutdown() {
-        while (true) {
-            if (executorService.getQueue().isEmpty() && executorService.getActiveCount() == 0) {
-                executorService.shutdown();
-                try {
-                    if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                        executorService.shutdownNow();
-                    }
-                } catch (InterruptedException e) {
+    private void monitorAndShutdown(ThreadPoolExecutor executorService) {
+        try {
+            while (inFlightTasks.get() > 0 || !executorService.getQueue().isEmpty() || executorService.getActiveCount() > 0) {
+                Thread.sleep(500);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executorService.shutdown();
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
                     executorService.shutdownNow();
                 }
-                System.out.println("Finished multithreaded crawl. Visited " + visitedUrls.size() + " unique URLs.");
-                return;
-            }
-            try {
-                Thread.sleep(1000);
             } catch (InterruptedException e) {
+                executorService.shutdownNow();
                 Thread.currentThread().interrupt();
-                break;
             }
+            System.out.println("Finished multithreaded crawl. Visited " + visitedUrls.size() + " unique URLs.");
         }
+    }
+
+    private String normalizeUrl(String url) {
+        if (url == null) return "";
+        String trimmed = url.trim();
+        int hashIdx = trimmed.indexOf('#');
+        return hashIdx != -1 ? trimmed.substring(0, hashIdx) : trimmed;
     }
 
     private boolean isSameDomain(String startUrl, String newUrl) {
@@ -117,7 +138,12 @@ public class CrawlerService {
             URI newUri = new URI(newUrl);
             String startDomain = startUri.getHost();
             String newDomain = newUri.getHost();
-            return newDomain != null && newDomain.endsWith(startDomain);
+            if (startDomain == null || newDomain == null) {
+                return false;
+            }
+            startDomain = startDomain.toLowerCase();
+            newDomain = newDomain.toLowerCase();
+            return newDomain.equals(startDomain) || newDomain.endsWith("." + startDomain);
         } catch (URISyntaxException e) {
             return false;
         }
