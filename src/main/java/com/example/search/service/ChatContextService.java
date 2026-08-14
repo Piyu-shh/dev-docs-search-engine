@@ -1,44 +1,49 @@
 package com.example.search.service;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Service
 public class ChatContextService {
 
-    // Session ID → List of chat messages
-    private final ConcurrentHashMap<String, List<ChatMessage>> chatContexts = new ConcurrentHashMap<>();
+    // Session ID -> List of chat messages
+    private final ConcurrentHashMap<String, CopyOnWriteArrayList<ChatMessage>> chatContexts = new ConcurrentHashMap<>();
+    private final int maxHistoryMessages;
 
-    private static final int MAX_HISTORY_MESSAGES = 10; // Keep last 10 messages
+    public ChatContextService(@Value("${chat.context.max.messages:10}") int maxHistoryMessages) {
+        this.maxHistoryMessages = maxHistoryMessages;
+    }
 
     /**
      * Add a user message to the chat context
      */
     public void addUserMessage(String sessionId, String message) {
-        List<ChatMessage> context = chatContexts.computeIfAbsent(sessionId, k -> new ArrayList<>());
-        context.add(new ChatMessage("user", message, System.currentTimeMillis()));
-
-        // Trim old messages
-        if (context.size() > MAX_HISTORY_MESSAGES) {
-            context = new ArrayList<>(context.subList(context.size() - MAX_HISTORY_MESSAGES, context.size()));
-            chatContexts.put(sessionId, context);
+        if (sessionId == null || message == null || message.trim().isEmpty()) {
+            return;
         }
+        addMessage(sessionId, new ChatMessage("user", message.trim(), System.currentTimeMillis()));
     }
 
     /**
-     * Add an assistant (Gemma) response to the chat context
+     * Add an assistant response to the chat context
      */
     public void addAssistantMessage(String sessionId, String message) {
-        List<ChatMessage> context = chatContexts.computeIfAbsent(sessionId, k -> new ArrayList<>());
-        context.add(new ChatMessage("assistant", message, System.currentTimeMillis()));
+        if (sessionId == null || message == null || message.trim().isEmpty()) {
+            return;
+        }
+        addMessage(sessionId, new ChatMessage("assistant", message.trim(), System.currentTimeMillis()));
+    }
 
-        // Trim old messages
-        if (context.size() > MAX_HISTORY_MESSAGES) {
-            context = new ArrayList<>(context.subList(context.size() - MAX_HISTORY_MESSAGES, context.size()));
-            chatContexts.put(sessionId, context);
+    private synchronized void addMessage(String sessionId, ChatMessage msg) {
+        CopyOnWriteArrayList<ChatMessage> context = chatContexts.computeIfAbsent(sessionId, k -> new CopyOnWriteArrayList<>());
+        context.add(msg);
+        while (context.size() > maxHistoryMessages) {
+            context.remove(0);
         }
     }
 
@@ -46,7 +51,9 @@ public class ChatContextService {
      * Get the chat context for a session
      */
     public List<ChatMessage> getChatContext(String sessionId) {
-        return chatContexts.getOrDefault(sessionId, new ArrayList<>());
+        if (sessionId == null) return new ArrayList<>();
+        List<ChatMessage> list = chatContexts.get(sessionId);
+        return list != null ? new ArrayList<>(list) : new ArrayList<>();
     }
 
     /**
@@ -63,7 +70,6 @@ public class ChatContextService {
         for (ChatMessage msg : context) {
             sb.append(msg.getRole()).append(": ").append(msg.getContent()).append("\n");
         }
-        sb.append("\nCurrent question: ");
         return sb.toString();
     }
 
@@ -71,13 +77,16 @@ public class ChatContextService {
      * Clear chat context for a session
      */
     public void clearContext(String sessionId) {
-        chatContexts.remove(sessionId);
+        if (sessionId != null) {
+            chatContexts.remove(sessionId);
+        }
     }
 
     /**
      * Check if a session has chat history
      */
     public boolean hasContext(String sessionId) {
+        if (sessionId == null) return false;
         List<ChatMessage> context = chatContexts.get(sessionId);
         return context != null && !context.isEmpty();
     }
@@ -86,6 +95,7 @@ public class ChatContextService {
      * Get number of messages in context
      */
     public int getContextSize(String sessionId) {
+        if (sessionId == null) return 0;
         List<ChatMessage> context = chatContexts.get(sessionId);
         return context != null ? context.size() : 0;
     }
@@ -112,7 +122,7 @@ public class ChatContextService {
         public String toString() {
             return "ChatMessage{" +
                     "role='" + role + '\'' +
-                    ", content='" + (content.length() > 50 ? content.substring(0, 50) + "..." : content) + '\'' +
+                    ", content='" + (content != null && content.length() > 50 ? content.substring(0, 50) + "..." : content) + '\'' +
                     ", timestamp=" + timestamp +
                     '}';
         }
