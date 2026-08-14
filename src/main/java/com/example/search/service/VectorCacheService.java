@@ -161,21 +161,41 @@ public class VectorCacheService {
     }
 
     /**
-     * Clear all vector cache
+     * Clear all vector and embedding cache keys without flushing the entire Redis database
      */
     public void clearAllVectorCache() {
         try {
-            redisTemplate.getConnectionFactory().getConnection().flushAll();
-            System.out.println("Vector cache cleared");
+            java.util.Set<String> vectorKeys = redisTemplate.keys(VECTOR_CACHE_PREFIX + "*");
+            if (vectorKeys != null && !vectorKeys.isEmpty()) {
+                redisTemplate.delete(vectorKeys);
+            }
+            java.util.Set<String> embeddingKeys = redisTemplate.keys(EMBEDDING_CACHE_PREFIX + "*");
+            if (embeddingKeys != null && !embeddingKeys.isEmpty()) {
+                redisTemplate.delete(embeddingKeys);
+            }
+            System.out.println("Vector and embedding cache keys cleared");
         } catch (Exception e) {
             System.err.println("Error clearing cache: " + e.getMessage());
         }
     }
 
     /**
-     * Hash text for use as cache key
+     * Hash text for use as cache key using SHA-256
      */
     private String hashText(String text) {
-        return Integer.toHexString(text.hashCode());
+        if (text == null) return "";
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(text.hashCode());
+        }
     }
 }
