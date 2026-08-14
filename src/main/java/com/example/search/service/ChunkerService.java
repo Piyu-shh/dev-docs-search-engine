@@ -1,6 +1,5 @@
 package com.example.search.service;
 
-import org.apache.commons.text.StringTokenizer;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -25,35 +24,46 @@ public class ChunkerService {
     public List<String> chunkText(String text, int chunkSize, int overlap) {
         List<String> chunks = new ArrayList<>();
 
-        if (text == null || text.trim().isEmpty()) {
+        if (text == null || text.trim().isEmpty() || chunkSize <= 0) {
             return chunks;
         }
 
-        // Character-based chunking
-        if (text.length() <= chunkSize) {
-            chunks.add(text);
+        // Sanitize overlap to be strictly less than chunkSize
+        int effectiveOverlap = Math.max(0, Math.min(overlap, chunkSize - 1));
+        int length = text.length();
+
+        if (length <= chunkSize) {
+            String trimmed = text.trim();
+            if (!trimmed.isEmpty()) {
+                chunks.add(trimmed);
+            }
             return chunks;
         }
 
         int start = 0;
-        while (start < text.length()) {
-            int end = Math.min(start + chunkSize, text.length());
-            
+        while (start < length) {
+            int end = Math.min(start + chunkSize, length);
+
             // Try to break at word boundary
-            if (end < text.length()) {
+            if (end < length) {
                 int lastSpace = text.lastIndexOf(' ', end);
                 if (lastSpace > start + (chunkSize / 2)) {
                     end = lastSpace;
                 }
             }
 
-            chunks.add(text.substring(start, end).trim());
-
-            // Move start with overlap, but ensure progress
-            start = end - overlap;
-            if (start <= end - overlap) {
-                start = end;
+            String chunk = text.substring(start, end).trim();
+            if (!chunk.isEmpty()) {
+                chunks.add(chunk);
             }
+
+            if (end >= length) {
+                break;
+            }
+
+            // Move start with overlap, ensuring strictly positive forward progress
+            int nextStart = Math.max(start + 1, end - effectiveOverlap);
+            start = nextStart;
         }
 
         return chunks;
